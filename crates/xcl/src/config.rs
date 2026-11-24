@@ -20,6 +20,14 @@ pub struct Config {
     /// Title memory budget reported by TitleMemoryStatus (MiB); 0 = the standard budget of
     /// `device_type` (13 824 Series X, 8 192 Series S).
     pub title_memory_mb: u64,
+    /// With `title_memory_mb = 0`: lower the standard budget to what the host GPU's dedicated
+    /// video memory holds (see `title_memory_for_host`). Off: the console's figure whatever the
+    /// GPU has, with a warning in the log when it is more. `XCL_TITLE_MEMORY_FIT` overrides.
+    pub title_memory_fit: bool,
+    /// Set by `resolve`, not a setting: `title_memory_mb` was 0 in xcl.toml, so the budget is
+    /// the device's standard one (an explicit figure is never changed).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub title_memory_standard: bool,
     /// "auto" (MicrosoftGame.Config), "standard" or "advanced" title memory mode.
     pub title_memory: String,
     /// Persistent local storage quota (MiB); 0 = MicrosoftGame.Config, else 4096.
@@ -91,6 +99,7 @@ impl Config {
         }
         // the standard budgets; "advanced" adds memory the console docs do not give publicly –
         // the standard figure stays (xcl.toml can raise it)
+        self.title_memory_standard = self.title_memory_mb == 0;
         self.title_memory_mb = self.title_memory_budget_mb();
         if self.pls_mb == 0 {
             self.pls_mb = match manifest.and_then(|m| m.pls_mb) {
@@ -121,7 +130,38 @@ impl Config {
             v => v,
         }
     }
+
+    /// Whether the standard budget follows the host GPU: `title_memory_fit`, or
+    /// `XCL_TITLE_MEMORY_FIT` (0 / off / false, anything else on) when set.
+    pub fn title_memory_fits_host(&self) -> bool {
+        match std::env::var("XCL_TITLE_MEMORY_FIT") {
+            Ok(v) if !v.trim().is_empty() => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false"),
+            _ => self.title_memory_fit,
+        }
+    }
+
+    /// The budget the title is told on a host GPU with `vram_mb` MiB of dedicated video memory
+    /// (0 = unknown: WARP, no adapter). The console's budget is one memory for CPU and GPU, and
+    /// a title plans its texture streaming against it: told 13 824 MiB on an 8 GiB card it
+    /// plans for more textures than the card holds and dies when the world starts streaming
+    /// (#1337). So the standard budget is lowered to the card's memory less
+    /// `VRAM_HEADROOM_MB`, never below `TITLE_MEMORY_FLOOR_MB`. A figure written in xcl.toml
+    /// is kept as it is, and so is the standard one with `fit` off.
+    pub fn title_memory_for_host(&self, vram_mb: u64, fit: bool) -> u64 {
+        let budget = self.title_memory_budget_mb();
+        if !fit || !self.title_memory_standard || vram_mb == 0 {
+            return budget;
+        }
+        budget.min(vram_mb.saturating_sub(VRAM_HEADROOM_MB).max(TITLE_MEMORY_FLOOR_MB))
+    }
 }
+
+/// Video memory left out of a budget that follows the GPU (MiB): the desktop's share and XCL's
+/// own resources (swap chain, pipelines, upload heaps).
+pub const VRAM_HEADROOM_MB: u64 = 1_536;
+/// A budget that follows the GPU is not lowered below this (MiB): under it titles have been
+/// seen to fail whatever they are told (#1337: 4 096 on an 8 GiB card).
+pub const TITLE_MEMORY_FLOOR_MB: u64 = 4_096;
 
 /// Mount target of the persistent local storage drive (`XPersistentLocalStorageGetPath`).
 pub const PLS_MOUNT_TARGET: &str = "{data}\\pls";
@@ -165,6 +205,8 @@ impl Default for Config {
             console_id: CONSOLE_ID.into(),
             sandbox_id: "RETAIL".into(),
             title_memory_mb: 0,
+            title_memory_fit: true,
+            title_memory_standard: false,
             title_memory: "auto".into(),
             pls_mb: 0,
             uma_mb: 0,
@@ -351,6 +393,36 @@ mod tests {
         let mut c = Config::default();
         c.resolve(Some(&manifest));
         assert_eq!((c.title_memory.as_str(), c.title_memory_mb), ("standard", 13_824));
+    }
+
+    #[test]
+    fn the_standard_budget_follows_the_host_gpu() {
+        let resolved = |toml: &str| {
+            let mut c: Config = toml::from_str(toml).unwrap();
+            c.resolve(None);
+            c
+        };
+        let x = resolved("");
+        assert!(x.title_memory_standard && x.title_memory_fit);
+        // 8, 12 and 24 GiB cards; an unknown adapter keeps the console's figure
+        assert_eq!(x.title_memory_for_host(8_192, true), 8_192 - VRAM_HEADROOM_MB);
+        assert_eq!(x.title_memory_for_host(12_288, true), 12_288 - VRAM_HEADROOM_MB);
+        assert_eq!(x.title_memory_for_host(24_576, true), 13_824);
+        assert_eq!(x.title_memory_for_host(0, true), 13_824);
+        // never below the floor, and not at all when turned off
+        assert_eq!(x.title_memory_for_host(4_096, true), TITLE_MEMORY_FLOOR_MB);
+        assert_eq!(x.title_memory_for_host(8_192, false), 13_824);
+        // Series S: its own, smaller budget
+        let s = resolved("device_type = \"lockhart\"\n");
+        assert_eq!(s.title_memory_for_host(8_192, true), 8_192 - VRAM_HEADROOM_MB);
+        assert_eq!(s.title_memory_for_host(16_384, true), 8_192);
+        // a figure written in xcl.toml is kept, above or below the card
+        let explicit = resolved("title_memory_mb = 13824\n");
+        assert!(!explicit.title_memory_standard);
+        assert_eq!(explicit.title_memory_for_host(8_192, true), 13_824);
+        // the mark is not a setting: xcl.toml is written without it, boot.json carries it
+        assert!(!toml::to_string_pretty(&Config::default()).unwrap().contains("title_memory_standard"));
+        assert!(toml::to_string_pretty(&x).unwrap().contains("title_memory_standard = true"));
     }
 
     #[test]

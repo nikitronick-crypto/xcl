@@ -112,6 +112,8 @@ fn test_title_runs_and_game_folder_is_untouched() {
         .arg("--")
         .arg("--hello")
         .env("XCL_DATA_ROOT", &data)
+        // the test title checks the console's figures: its budget is not fitted to this PC's GPU
+        .env("XCL_TITLE_MEMORY_FIT", "0")
         // the shader dumps and their translation, which the report's shader counts come from
         .env("XCL_DUMP_SHADERS", "1")
         .output()

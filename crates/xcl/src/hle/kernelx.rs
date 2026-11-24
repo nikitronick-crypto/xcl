@@ -680,7 +680,7 @@ pub unsafe extern "system" fn XMemGetWorkingSetStatistics(_flags: u32, stats: *m
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    let limit = crate::state::config().title_memory_budget_mb() * 1024 * 1024;
+    let limit = crate::state::title_memory_budget_mb() * 1024 * 1024;
     (stats as *mut u64).write_unaligned(limit);
     (stats.add(8) as *mut u64).write_unaligned(process_private_bytes().min(limit));
     1
@@ -750,7 +750,7 @@ pub unsafe extern "system" fn TitleMemoryStatus(buf: *mut TitleMemoryStatusT) ->
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    let total = crate::state::config().title_memory_budget_mb() * 1024 * 1024;
+    let total = crate::state::title_memory_budget_mb() * 1024 * 1024;
     let used = process_private_bytes().min(total);
     let b = &mut *buf;
     b.total = total;

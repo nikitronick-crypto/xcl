@@ -22,6 +22,38 @@ pub fn config() -> &'static Config {
     }
 }
 
+/// The title memory budget on this host (MiB): the configured one, the standard figure lowered
+/// to the GPU's dedicated video memory (`Config::title_memory_for_host`). Worked out once, at
+/// the first call: titles ask for it before they create their device, and what they were told
+/// must not change afterwards.
+pub fn title_memory_budget_mb() -> u64 {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let c = config();
+        let standard = c.title_memory_budget_mb();
+        // only a resolved configuration with the standard budget asks the GPU (unit tests and
+        // a figure from xcl.toml do not)
+        if !c.title_memory_standard {
+            return standard;
+        }
+        let Some((vram, name)) = crate::gpu::adapter::dedicated_vram_mb(&c.d3d12_adapter) else {
+            return standard;
+        };
+        let fit = c.title_memory_fits_host();
+        let budget = c.title_memory_for_host(vram, fit);
+        if budget < standard {
+            crate::xlog_info!(
+                "title memory: {budget} MiB instead of the console's {standard} MiB – {name} has {vram} MiB of video memory (title_memory_mb in xcl.toml sets a figure, title_memory_fit = false keeps the console's)"
+            );
+        } else if standard > vram {
+            crate::xlog_warn!(
+                "title memory: the console's {standard} MiB is more than the {vram} MiB of video memory of {name} – the title may plan for more textures than fit (title_memory_fit = true lowers it, title_memory_mb sets a figure)"
+            );
+        }
+        budget
+    })
+}
+
 /// Folder for title data (saves, PLS, temp…) – a temp folder when no boot record.
 pub fn data_dir() -> std::path::PathBuf {
     match BOOT.get() {

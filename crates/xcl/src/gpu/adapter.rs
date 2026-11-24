@@ -149,6 +149,26 @@ pub fn candidates(factory: &IDXGIFactory6, sel: &Selector) -> Vec<(IDXGIAdapter1
     hw.into_iter().enumerate().filter(|(i, _)| keep[*i]).map(|(_, a)| a).collect()
 }
 
+/// Dedicated video memory (MiB) and name of the hardware adapter the title's device is made on
+/// for `configured` (`XCL_ADAPTER` overrides): the first one the selector allows, or of all of
+/// them when it matches none, as `hle::d3d12x::real` falls back. `None` for `warp`, without a
+/// hardware adapter, or when DXGI is not there.
+/// shortcut: the first candidate, without creating a device – an adapter that then fails to
+/// create one makes the title's device the next candidate, whose memory may differ.
+pub fn dedicated_vram_mb(configured: &str) -> Option<(u64, String)> {
+    let sel = Selector::from_env_or(configured);
+    if sel == Selector::Warp {
+        return None;
+    }
+    let factory: IDXGIFactory6 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.ok()?;
+    let mut list = candidates(&factory, &sel);
+    if list.is_empty() {
+        list = candidates(&factory, &Selector::Auto);
+    }
+    let (_, desc) = list.into_iter().next()?;
+    Some(((desc.DedicatedVideoMemory as u64) >> 20, name(&desc)))
+}
+
 /// "`sel` matches no adapter (have: 0 = …, 1 = …)" – for logs and test skips.
 pub fn no_match(factory: &IDXGIFactory6, sel: &Selector) -> String {
     let have: Vec<String> = hardware(factory).iter().enumerate().map(|(i, (_, d))| format!("{i} = {}", name(d))).collect();
