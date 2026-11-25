@@ -891,6 +891,17 @@ fn note_request(r: &Request) {
     }
 }
 
+/// Requests in a row whose page entries stayed 0 for the whole wait, after which the wait is
+/// left out (but for one request in 64): a title that never fills them must not be held up.
+const PAGE_FILL_MISSES: u32 = 4;
+
+/// How long a request whose destination page entries are still 0 at its turn looks again
+/// (`XCL_DSTORAGE_PAGE_WAIT_MS`, 100 unless set; 0: not at all, as before).
+fn page_fill_wait() -> std::time::Duration {
+    static W: OnceLock<std::time::Duration> = OnceLock::new();
+    *W.get_or_init(|| std::time::Duration::from_millis(std::env::var("XCL_DSTORAGE_PAGE_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(100)))
+}
+
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
@@ -972,12 +983,46 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         let zeros_at_enqueue = pages.iter().filter(|&&p| p == 0).count();
         let late: Vec<usize>;
         let pages = if pages.contains(&0) {
+            // The entry may be filled a little after the request's turn too: a retail game
+            // started as a Series S had 1 124 requests in a tenth of a second whose pages were
+            // still 0 when this ran, and went on to read what they never brought. On the
+            // console a request waits for the drive; here its turn comes at once. So the array
+            // is looked at again for a short while (`page_fill_wait`) before the request fails.
+            static MISSES: AtomicU32 = AtomicU32::new(0);
+            static WAITED: AtomicU64 = AtomicU64::new(0);
+            let wait = if MISSES.load(Ordering::Relaxed) < PAGE_FILL_MISSES || WAITED.fetch_add(1, Ordering::Relaxed) % 64 == 0 { page_fill_wait() } else { std::time::Duration::ZERO };
+            let asked = std::time::Instant::now();
             let mut now = vec![0usize; pages.len()];
-            if read_own(r.destination as usize, now.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages)) {
-                late = pages.iter().zip(&now).map(|(&then, &now)| if then != 0 { then } else { now }).collect();
-                &late[..]
-            } else {
-                pages
+            let mut merged: Option<Vec<usize>> = None;
+            loop {
+                if !read_own(r.destination as usize, now.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages)) {
+                    break;
+                }
+                let m: Vec<usize> = pages.iter().zip(&now).map(|(&then, &now)| if then != 0 { then } else { now }).collect();
+                let filled = !m.contains(&0);
+                merged = Some(m);
+                if filled || asked.elapsed() >= wait {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            match merged {
+                Some(m) => {
+                    if m.contains(&0) {
+                        MISSES.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        MISSES.store(0, Ordering::Relaxed);
+                        let ms = asked.elapsed().as_millis();
+                        static LATE: AtomicU64 = AtomicU64::new(0);
+                        let n = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+                        if ms > 0 && (n <= 8 || n.is_power_of_two()) {
+                            crate::xlog_info!("DirectStorage: a destination's physical pages were filled in {ms} ms after the request's turn (#{n})");
+                        }
+                    }
+                    late = m;
+                    &late[..]
+                }
+                None => pages,
             }
         } else {
             pages
