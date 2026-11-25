@@ -825,6 +825,28 @@ fn writable(p: usize, n: usize) -> bool {
     true
 }
 
+/// The first region of `n` bytes at `p` that `writable` refuses, as Windows describes it: its
+/// start, size, state (0x1000 committed, 0x2000 reserved, 0x10000 free) and protection.
+fn unwritable_region(p: usize, n: usize) -> String {
+    let Some(end) = p.checked_add(n) else { return "the range wraps".to_string() };
+    let mut at = p;
+    while at < end {
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+            return format!("no answer for {at:#x}");
+        }
+        let rw = 0x04 | 0x08 | 0x40 | 0x80;
+        if m.State != MEM_COMMIT || m.Protect & rw == 0 || m.Protect & 0x100 != 0 {
+            return format!(
+                "region {:#x} + {:#x}: state {:#x}, protection {:#x}, allocated at {:#x} with {:#x}, type {:#x}",
+                m.BaseAddress as usize, m.RegionSize, m.State, m.Protect, m.AllocationBase as usize, m.AllocationProtect, m.Type
+            );
+        }
+        at = m.BaseAddress as usize + m.RegionSize;
+    }
+    "writable when asked again".to_string()
+}
+
 fn read_exact_at(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), HRESULT> {
     let mut done = 0;
     while done < buf.len() {
@@ -874,6 +896,18 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     let n = r.destination_size as usize;
     note_request(r);
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
+        // which memory it is that cannot take the bytes: the first of them and then every
+        // doubling (a retail game's world load has thousands of these in a few seconds)
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let seen = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+        if seen <= 8 || seen.is_power_of_two() {
+            crate::xlog_warn!(
+                "DirectStorage: destination {:#x} ({n} bytes, options {:#x}) is not writable – {} (#{seen})",
+                r.destination,
+                r.options,
+                unwritable_region(r.destination as usize, n)
+            );
+        }
         return Err(E_ACCESS_VIOLATION);
     }
     let src: Vec<u8> = if r.memory_source() {
