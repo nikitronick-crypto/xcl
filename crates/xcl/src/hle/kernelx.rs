@@ -537,8 +537,26 @@ unsafe fn aligned_heap_alloc(size: usize, align: usize) -> *mut c_void {
     aligned as *mut c_void
 }
 
+/// Whether `p` can be a block of `aligned_heap_alloc`: those are 16 bytes or more aligned and
+/// lie in the process heap, never in the title's graphics memory.
+fn heap_block_address(p: usize) -> bool {
+    p & 0xf == 0 && p >= 16 && !crate::gpu::uma::get().is_some_and(|u| u.contains(p))
+}
+
 unsafe fn aligned_heap_free(p: *mut c_void) {
     if p.is_null() {
+        return;
+    }
+    if !heap_block_address(p as usize) {
+        // Not a block handed out here: its header is not read (a retail game's video decoder
+        // had 0xa197eff5b freed through the title's allocator hooks, an odd address inside the
+        // title's graphics memory, and reading the 8 bytes before it ended the title while its
+        // first cutscene played). The memory, whose ever it is, is left as it is.
+        static SEEN: AtomicUsize = AtomicUsize::new(0);
+        let seen = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+        if seen <= 8 || seen.is_power_of_two() {
+            crate::xlog_warn!("XMemFree: {:#x} is not a block XMemAlloc handed out (not 16-byte aligned, or inside the title's graphics memory) – left as it is (#{seen})", p as usize);
+        }
         return;
     }
     let raw = *((p as usize - 8) as *const usize);
@@ -2679,6 +2697,22 @@ mod tests {
                 assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), PAGES, pages.as_mut_ptr()), 1);
                 mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
             }
+        }
+    }
+
+    /// `aligned_heap_free` does not read the header of an address that is no block of
+    /// `aligned_heap_alloc`.
+    #[test]
+    fn an_address_that_cannot_be_a_heap_block_is_told_before_its_header_is_read() {
+        // the address a title's video decoder had freed: odd, inside the title's graphics memory
+        assert!(!heap_block_address(0xa197eff5b));
+        assert!(!heap_block_address(8));
+        unsafe {
+            let p = aligned_heap_alloc(64, 16);
+            assert!(heap_block_address(p as usize));
+            aligned_heap_free(p);
+            // freed without a fault: nothing before it is read
+            aligned_heap_free(0xa197eff5b_usize as *mut c_void);
         }
     }
 
