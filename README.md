@@ -140,9 +140,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
 - **Title memory:** a title is told the console's memory budget (13 824 MiB as Series X, 8 192 as
   Series S), and plans its texture streaming against it. On a GPU with less dedicated video memory
-  the standard budget is lowered to that memory less 1 536 MiB (never below 4 096); the log says
-  so at the first query. `title_memory_mb = N` in `xcl.toml` sets a figure of your own, and
-  `title_memory_fit = false` (or `XCL_TITLE_MEMORY_FIT=0`) keeps the console's.
+  the standard budget is lowered to that memory less 1 536 MiB (never below 4 096; an integrated
+  GPU counts with its shared memory); the log says so when XCL starts. `title_memory_mb = N` in
+  `xcl.toml` sets a figure of your own, and `title_memory_fit = false` (or
+  `XCL_TITLE_MEMORY_FIT=0`) keeps the console's.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).

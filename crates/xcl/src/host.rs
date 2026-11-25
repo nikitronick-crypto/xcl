@@ -29,6 +29,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    // what the title will be told as its memory budget, worked out and logged here: at its
+    // first query the answer is ready, and the log says it whether or not the title asks
+    let _ = crate::state::title_memory_budget_mb();
     // `XCL_ACTIVITY=1`: every 2 s what the title did since (a timeline of where it stops)
     if std::env::var_os("XCL_ACTIVITY").is_some() {
         let _ = std::thread::Builder::new().name("xcl-activity".into()).spawn(|| {

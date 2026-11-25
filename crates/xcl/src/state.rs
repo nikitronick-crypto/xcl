@@ -23,9 +23,9 @@ pub fn config() -> &'static Config {
 }
 
 /// The title memory budget on this host (MiB): the configured one, the standard figure lowered
-/// to the GPU's dedicated video memory (`Config::title_memory_for_host`). Worked out once, at
-/// the first call: titles ask for it before they create their device, and what they were told
-/// must not change afterwards.
+/// to the GPU's video memory (`Config::title_memory_for_host`). Worked out once: the host does
+/// so when it starts, before the title runs. What a title was told must not change afterwards,
+/// and no title thread has to ask DXGI in the middle of a call.
 pub fn title_memory_budget_mb() -> u64 {
     static BUDGET: OnceLock<u64> = OnceLock::new();
     *BUDGET.get_or_init(|| {
@@ -36,9 +36,12 @@ pub fn title_memory_budget_mb() -> u64 {
         if !c.title_memory_standard {
             return standard;
         }
-        let Some((vram, name)) = crate::gpu::adapter::dedicated_vram_mb(&c.d3d12_adapter) else {
+        let Some((dedicated, shared, name)) = crate::gpu::adapter::video_memory_mb(&c.d3d12_adapter) else {
             return standard;
         };
+        let vram = crate::config::host_video_memory_mb(dedicated, shared);
+        // an integrated adapter is named with what its figure is made of
+        let name = if vram != dedicated { format!("{name} (integrated: dedicated and shared memory)") } else { name };
         let fit = c.title_memory_fits_host();
         let budget = c.title_memory_for_host(vram, fit);
         if budget < standard {

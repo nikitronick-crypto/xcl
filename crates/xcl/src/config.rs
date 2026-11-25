@@ -159,6 +159,21 @@ impl Config {
 /// Video memory left out of a budget that follows the GPU (MiB): the desktop's share and XCL's
 /// own resources (swap chain, pipelines, upload heaps).
 pub const VRAM_HEADROOM_MB: u64 = 1_536;
+/// An adapter with less dedicated video memory than this (MiB) is an integrated one: its
+/// textures live in the system's memory, which DXGI reports as shared (Intel: 128 dedicated).
+pub const INTEGRATED_DEDICATED_MB: u64 = 1_024;
+
+/// The video memory (MiB) a budget that follows the GPU goes by: the adapter's dedicated
+/// memory, and for an integrated adapter its shared memory with it: going by the dedicated
+/// alone would take such an adapter for a card of 128 MiB.
+pub fn host_video_memory_mb(dedicated_mb: u64, shared_mb: u64) -> u64 {
+    if dedicated_mb < INTEGRATED_DEDICATED_MB {
+        dedicated_mb + shared_mb
+    } else {
+        dedicated_mb
+    }
+}
+
 /// A budget that follows the GPU is not lowered below this (MiB): under it titles have been
 /// seen to fail whatever they are told (#1337: 4 096 on an 8 GiB card).
 pub const TITLE_MEMORY_FLOOR_MB: u64 = 4_096;
@@ -420,6 +435,12 @@ mod tests {
         let explicit = resolved("title_memory_mb = 13824\n");
         assert!(!explicit.title_memory_standard);
         assert_eq!(explicit.title_memory_for_host(8_192, true), 13_824);
+        // an integrated adapter is measured by its shared memory too, a card by its own alone
+        assert_eq!(host_video_memory_mb(128, 8_100), 8_228);
+        assert_eq!(host_video_memory_mb(512, 15_000), 15_512);
+        assert_eq!(host_video_memory_mb(8_017, 16_000), 8_017);
+        assert_eq!(host_video_memory_mb(12_084, 16_000), 12_084);
+        assert_eq!(x.title_memory_for_host(host_video_memory_mb(128, 8_100), true), 8_228 - VRAM_HEADROOM_MB);
         // the mark is not a setting: xcl.toml is written without it, boot.json carries it
         assert!(!toml::to_string_pretty(&Config::default()).unwrap().contains("title_memory_standard"));
         assert!(toml::to_string_pretty(&x).unwrap().contains("title_memory_standard = true"));
