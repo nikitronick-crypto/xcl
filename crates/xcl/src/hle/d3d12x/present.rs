@@ -85,15 +85,34 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("D3D12.X: PresentX now with {plane_count} plane(s): {words:x?}");
         }
     }
-    let count = (planes.add(8) as *const u32).read_unaligned();
-    let list = (planes.add(0x10) as *const usize).read_unaligned();
-    if count == 0 || !crate::gpu::shader::readable(list, 8) || !enabled() {
+    {
+        // what each plane holds, once per change in their number: the size and format of its
+        // first resource say which is the game's image and which the UI's
+        static LAST: AtomicU64 = AtomicU64::new(1);
+        if plane_count > 1 && LAST.swap(plane_count as u64, Ordering::Relaxed) != plane_count as u64 {
+            for k in 0..plane_count as usize {
+                let what = match plane_resource(planes, k, plane_stride()) {
+                    Some(res) => {
+                        let d = ID3D12Resource::from_raw_borrowed(&(res as *mut c_void)).map(|r| r.GetDesc());
+                        match d {
+                            Some(d) => format!("{res:#x}, {}x{}, format {}, flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0),
+                            None => format!("{res:#x}"),
+                        }
+                    }
+                    None => "no resource".to_string(),
+                };
+                crate::xlog_info!("D3D12.X: PresentX plane {k} of {plane_count}: {what} (shown: plane {}, XCL_PRESENT_PLANE)", shown_plane().min(plane_count as usize - 1));
+            }
+        }
+    }
+    if !enabled() {
         return;
     }
-    let res = (list as *const usize).read_unaligned();
-    if res == 0 {
+    // plane 0 unless XCL_PRESENT_PLANE names another one the title presents
+    let shown = shown_plane().min(plane_count as usize - 1);
+    let Some(res) = plane_resource(planes, shown, plane_stride()).or_else(|| plane_resource(planes, 0, plane_stride())) else {
         return;
-    }
+    };
     {
         let mut p = PRESENTED.lock().unwrap();
         if !p.contains(&res) {
@@ -139,6 +158,48 @@ fn now_ms() -> u64 {
 
 pub fn counters() -> (u64, u64) {
     (PRESENTS.load(Ordering::Relaxed), BOUNDARIES.load(Ordering::Relaxed))
+}
+
+/// `XCL_PRESENT_PLANE=<n>`: the plane of a title's `PresentX` that XCL shows (0, the first,
+/// unless set). A title that presents two planes hands the console's display a UI plane and
+/// the game's image to compose; XCL shows one resource, and with the first plane a retail
+/// game started as a Series S showed a black window while it drew and presented 30 frames a
+/// second. An experiment's switch: XCL does not compose planes yet.
+fn shown_plane() -> usize {
+    static P: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("XCL_PRESENT_PLANE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Bytes from one plane of `PresentX` to the next (`XCL_PRESENT_PLANE_STRIDE`, 0x48 unless
+/// set): in the two planes that game logged, the second one's token, count and list stand nine
+/// words after the first one's.
+fn plane_stride() -> usize {
+    static S: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        let set = std::env::var("XCL_PRESENT_PLANE_STRIDE").ok();
+        set.as_deref().map(str::trim).and_then(|v| v.strip_prefix("0x").map_or_else(|| v.parse().ok(), |h| usize::from_str_radix(h, 16).ok())).filter(|&n| n >= 0x18).unwrap_or(0x48)
+    })
+}
+
+/// Where plane `index` of `stride` bytes keeps its resource count and its list: the offsets
+/// from the first plane's start (`{ u64 token; u32 count @8; ID3D12Resource** @0x10 }`).
+fn plane_fields(index: usize, stride: usize) -> Option<(usize, usize)> {
+    let base = index.checked_mul(stride)?;
+    Some((base.checked_add(8)?, base.checked_add(0x10)?))
+}
+
+/// The first resource of plane `index`, if that plane has one that can be read.
+unsafe fn plane_resource(planes: *const u8, index: usize, stride: usize) -> Option<usize> {
+    let (count_at, list_at) = plane_fields(index, stride)?;
+    if !crate::gpu::shader::readable(planes as usize + count_at, 0x10) {
+        return None;
+    }
+    let count = (planes.add(count_at) as *const u32).read_unaligned();
+    let list = (planes.add(list_at) as *const usize).read_unaligned();
+    if count == 0 || !crate::gpu::shader::readable(list, 8) {
+        return None;
+    }
+    Some((list as *const usize).read_unaligned()).filter(|&res| res != 0)
 }
 
 fn enabled() -> bool {
@@ -1119,6 +1180,28 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_second_plane_of_a_presentx_is_found_nine_words_on() {
+        // the two planes a title logged: token, count, list, two words more, then padding
+        assert_eq!(plane_fields(0, 0x48), Some((8, 0x10)));
+        assert_eq!(plane_fields(1, 0x48), Some((0x50, 0x58)));
+        assert_eq!(plane_fields(usize::MAX, 0x48), None);
+        let (first, second) = (0x1111_usize, 0x2222_usize);
+        let (list0, list1, empty) = ([first], [second], [0usize]);
+        let mut planes = [0u64; 18];
+        (planes[0], planes[1], planes[2]) = (1, 1, list0.as_ptr() as u64);
+        (planes[9], planes[10], planes[11]) = (1, 1, list1.as_ptr() as u64);
+        unsafe {
+            assert_eq!(plane_resource(planes.as_ptr().cast(), 0, 0x48), Some(first));
+            assert_eq!(plane_resource(planes.as_ptr().cast(), 1, 0x48), Some(second));
+            // a plane with no resources, and one whose list holds none
+            planes[10] = 0;
+            assert_eq!(plane_resource(planes.as_ptr().cast(), 1, 0x48), None);
+            (planes[10], planes[11]) = (1, empty.as_ptr() as u64);
+            assert_eq!(plane_resource(planes.as_ptr().cast(), 1, 0x48), None);
+        }
+    }
 
     #[test]
     fn present_ring_overlaps_previous_frame_and_drains_cleanly() {
