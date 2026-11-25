@@ -969,6 +969,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         // until the request is done: one it has freed or reused meanwhile cannot be told from
         // a late fill. Read like the snapshot (`read_own`): an array unmapped since then fails
         // the request instead of faulting in this worker (#476).
+        let zeros_at_enqueue = pages.iter().filter(|&&p| p == 0).count();
         let late: Vec<usize>;
         let pages = if pages.contains(&0) {
             let mut now = vec![0usize; pages.len()];
@@ -982,6 +983,19 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             pages
         };
         if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
+            // which pages they are: the first of these and then every doubling (a retail game's
+            // world load has hundreds in a few seconds)
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            let seen = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+            if seen <= 8 || seen.is_power_of_two() {
+                let kinds: Vec<String> = pages.iter().take(6).map(|&p| format!("{p:#x} {}", crate::hle::kernelx::physical_page_kind(p))).collect();
+                crate::xlog_warn!(
+                    "DirectStorage: {n} bytes at offset {:#x} of {} physical page(s) were not written – [{}]; {zeros_at_enqueue} of them 0 at enqueue (#{seen})",
+                    r.destination_page_offset,
+                    pages.len(),
+                    kinds.join(", ")
+                );
+            }
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
